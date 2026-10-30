@@ -1,0 +1,27 @@
+name: "gcp_course"
+version: "1.0.0"
+config-version: 2
+
+profile: "gcp_course"
+
+model-paths:   ["models"]
+macro-paths:   ["macros"]
+target-path:   "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  gcp_course:
+    bronze:
+      +materialized: view
+      +schema: bronze
+    silver:
+      +materialized: incremental
+      +schema: silver
+      +incremental_strategy: merge
+    gold:
+      +materialized: table
+      +schema: gold
+      +partition_by:
+        field: "report_date"
+        data_type: "date"
+      +cluster_by: ["category"]

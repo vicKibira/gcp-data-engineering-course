@@ -1,0 +1,124 @@
+# Phase 09 — LAB 9: CI/CD for ML with Cloud Build
+# Triggered on push to main: test → build container → run KFP pipeline → canary deploy
+#
+# Set up trigger:
+#   gcloud builds triggers create github \
+#     --repo-name=gcp-data-engineering-course \
+#     --repo-owner=YOUR_USERNAME \
+#     --branch-pattern=^main$ \
+#     --build-config=phase-09-mlops/cloudbuild.yaml
+
+substitutions:
+  _PROJECT_ID:    ${PROJECT_ID}
+  _REGION:        us-central1
+  _DATASET:       course_dataset
+  _REPO:          ml-containers
+  _MODEL_NAME:    churn-xgb-v1
+  _PIPELINE_ROOT: gs://${PROJECT_ID}-vertex-staging/pipelines
+  _AUC_THRESHOLD: "0.75"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+
+  # ── Step 1: Run unit tests ───────────────────────────────────────────────────
+  - name: "python:3.10-slim"
+    id: unit-tests
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install -q pytest xgboost scikit-learn pandas pyarrow
+        pytest phase-07-ml-foundations/ phase-08-ml-pipelines/ -v --tb=short
+
+  # ── Step 2: Build training container ─────────────────────────────────────────
+  - name: "gcr.io/cloud-builders/docker"
+    id: build-container
+    args:
+      - build
+      - -t
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train:$SHORT_SHA"
+      - -t
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train:latest"
+      - phase-07-ml-foundations/custom_training/
+    waitFor: ["unit-tests"]
+
+  # ── Step 3: Push container to Artifact Registry ───────────────────────────────
+  - name: "gcr.io/cloud-builders/docker"
+    id: push-container
+    args:
+      - push
+      - --all-tags
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train"
+    waitFor: ["build-container"]
+
+  # ── Step 4: Compile & submit Vertex AI KFP pipeline ──────────────────────────
+  - name: "python:3.10-slim"
+    id: submit-pipeline
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install -q kfp google-cloud-aiplatform
+        python phase-08-ml-pipelines/pipeline.py \
+          --project=$_PROJECT_ID \
+          --region=$_REGION \
+          --dataset=$_DATASET \
+          --pipeline_root=$_PIPELINE_ROOT \
+          --model_name=$_MODEL_NAME \
+          --auc_threshold=$_AUC_THRESHOLD \
+          --run_date=$SHORT_SHA
+    waitFor: ["push-container"]
+
+  # ── Step 5: Canary deploy (5% traffic to new model) ──────────────────────────
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: canary-deploy
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        MODEL_ID=$(gcloud ai models list \
+          --region=$_REGION \
+          --project=$_PROJECT_ID \
+          --filter="displayName:$_MODEL_NAME" \
+          --sort-by="~updateTime" \
+          --limit=1 \
+          --format="value(name)" 2>/dev/null || echo "")
+
+        if [ -z "$MODEL_ID" ]; then
+          echo "No model registered yet — skipping canary deploy"
+          exit 0
+        fi
+
+        ENDPOINT_ID=$(gcloud ai endpoints list \
+          --region=$_REGION \
+          --project=$_PROJECT_ID \
+          --filter="displayName:$_MODEL_NAME-endpoint" \
+          --format="value(name)" 2>/dev/null | head -1)
+
+        if [ -z "$ENDPOINT_ID" ]; then
+          echo "Creating endpoint..."
+          ENDPOINT_ID=$(gcloud ai endpoints create \
+            --display-name=$_MODEL_NAME-endpoint \
+            --region=$_REGION \
+            --project=$_PROJECT_ID \
+            --format="value(name)")
+        fi
+
+        echo "Deploying $MODEL_ID to $ENDPOINT_ID at 5% traffic..."
+        gcloud ai endpoints deploy-model "$ENDPOINT_ID" \
+          --model="$MODEL_ID" \
+          --region=$_REGION \
+          --project=$_PROJECT_ID \
+          --display-name="canary-$SHORT_SHA" \
+          --machine-type=n1-standard-4 \
+          --traffic-split="0=95,new=5"
+
+        echo "✓ Canary deployed at 5% traffic"
+    waitFor: ["submit-pipeline"]
+
+images:
+  - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train:$SHORT_SHA"
+  - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train:latest"
