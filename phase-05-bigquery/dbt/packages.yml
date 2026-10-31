@@ -1,0 +1,37 @@
+# Phase 05 — dbt packages.yml
+#
+# packages.yml lists external dbt packages to install.
+# Run `dbt deps` to download them into the dbt_packages/ directory.
+# (dbt_packages/ is git-ignored — always run `dbt deps` after cloning.)
+#
+# dbt_utils adds generic helper macros and tests:
+#   Tests (used in schema.yml):
+#     - dbt_utils.unique_combination_of_columns  — composite primary key check
+#     - dbt_utils.expression_is_true             — arbitrary SQL assertion
+#     - dbt_utils.not_null_proportion            — partial null tolerance
+#
+#   Macros (available in model SQL):
+#     - {{ dbt_utils.generate_surrogate_key([...]) }}  — deterministic surrogate key from columns
+#     - {{ dbt_utils.date_spine(...) }}                — generate a date series
+#     - {{ dbt_utils.pivot(...) }}                     — pivot rows to columns
+#     - {{ dbt_utils.safe_add([col1, col2]) }}         — null-safe addition
+#
+# dbt_expectations adds Great Expectations-style data quality tests:
+#   - expect_column_values_to_be_between           — range check
+#   - expect_column_proportion_of_unique_values_to_be_between
+#   - expect_table_row_count_to_be_between         — volume alert
+#
+# After adding packages here, run:
+#   dbt deps    # downloads packages into dbt_packages/
+#   dbt run     # models can now use the new macros and tests
+
+packages:
+  # dbt Labs utility macros and generic tests
+  # https://hub.getdbt.com/dbt-labs/dbt_utils/
+  - package: dbt-labs/dbt_utils
+    version: [">=1.0.0", "<2.0.0"]   # pin major version; allows patch upgrades
+
+  # Great Expectations-style column-level assertions for dbt
+  # https://hub.getdbt.com/calogica/dbt_expectations/
+  - package: calogica/dbt_expectations
+    version: [">=0.10.0", "<1.0.0"]  # pin major version; allows minor upgrades

@@ -1,50 +1,90 @@
 # Phase 09 — LAB 9: CI/CD for ML with Cloud Build
-# Triggered on push to main: test → build container → run KFP pipeline → canary deploy
+# ==================================================
+# Triggered on every push to the 'main' branch. Implements a full ML CI/CD
+# pipeline: unit tests → container build → training pipeline → canary deploy.
 #
-# Set up trigger:
+# What is Cloud Build?
+#   A serverless CI/CD platform on GCP. Each step runs in a Docker container
+#   and shares a workspace volume (/workspace) between steps. Steps can run
+#   in parallel (via waitFor) or sequentially.
+#
+# How to connect this to GitHub:
 #   gcloud builds triggers create github \
 #     --repo-name=gcp-data-engineering-course \
 #     --repo-owner=YOUR_USERNAME \
 #     --branch-pattern=^main$ \
 #     --build-config=phase-09-mlops/cloudbuild.yaml
+#
+# Pipeline stages:
+#   unit-tests        → verify code correctness before any GCP calls
+#   build-container   → docker build training image (parallel to tests)
+#   push-container    → push to Artifact Registry
+#   submit-pipeline   → compile KFP pipeline + submit Vertex AI training job
+#   canary-deploy     → deploy new model to 5% of endpoint traffic
+#
+# Substitution variables (can be overridden per trigger):
+#   _PROJECT_ID     — GCP project; uses the built-in $PROJECT_ID
+#   _REGION         — Vertex AI and Artifact Registry region
+#   _DATASET        — BigQuery dataset name
+#   _REPO           — Artifact Registry repository name
+#   _MODEL_NAME     — Vertex AI model display name (used for lookups)
+#   _PIPELINE_ROOT  — GCS path for KFP artifacts
+#   _AUC_THRESHOLD  — minimum AUC for the pipeline's quality gate
 
 substitutions:
-  _PROJECT_ID:    ${PROJECT_ID}
+  _PROJECT_ID:    ${PROJECT_ID}       # Cloud Build built-in: the project running the build
   _REGION:        us-central1
   _DATASET:       course_dataset
-  _REPO:          ml-containers
+  _REPO:          ml-containers       # Artifact Registry Docker repository name
   _MODEL_NAME:    churn-xgb-v1
   _PIPELINE_ROOT: gs://${PROJECT_ID}-vertex-staging/pipelines
-  _AUC_THRESHOLD: "0.75"
+  _AUC_THRESHOLD: "0.75"             # string because YAML substitutions are always strings
 
+# Log to Cloud Logging only (not GCS) — avoids extra storage costs and keeps
+# logs immediately queryable in the GCP console without navigating to a bucket.
 options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
 
-  # ── Step 1: Run unit tests ───────────────────────────────────────────────────
+  # ── Step 1: Run unit tests ────────────────────────────────────────────────────
+  # Run before any GCP API calls to fail fast on code errors.
+  # Uses a minimal Python image — no GCP credentials needed for unit tests.
+  # Note: waitFor is unset so this step starts immediately when the build begins.
   - name: "python:3.10-slim"
     id: unit-tests
     entrypoint: bash
     args:
       - -c
       - |
+        # Install test dependencies (xgboost + sklearn needed to import the training code)
         pip install -q pytest xgboost scikit-learn pandas pyarrow
+        # Run tests from both ML phases; -v shows each test name; --tb=short shows
+        # only the relevant lines of failing tracebacks (not the full stack)
         pytest phase-07-ml-foundations/ phase-08-ml-pipelines/ -v --tb=short
 
   # ── Step 2: Build training container ─────────────────────────────────────────
+  # Builds the XGBoost training image from phase-07's Dockerfile.
+  # Tags with both $SHORT_SHA (immutable, for audit) and 'latest' (for pipelines
+  # that pull the most recent version without knowing the exact SHA).
+  # SHORT_SHA is the first 7 characters of the triggering Git commit SHA.
   - name: "gcr.io/cloud-builders/docker"
     id: build-container
     args:
       - build
       - -t
-      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train:$SHORT_SHA"
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train:$SHORT_SHA"  # immutable tag
       - -t
-      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train:latest"
-      - phase-07-ml-foundations/custom_training/
-    waitFor: ["unit-tests"]
+      - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train:latest"       # mutable tag
+      - phase-07-ml-foundations/custom_training/    # build context (Dockerfile + train.py)
+    waitFor: ["unit-tests"]   # only build if tests pass
 
   # ── Step 3: Push container to Artifact Registry ───────────────────────────────
+  # --all-tags pushes both the SHA tag and 'latest' in a single command.
+  # Artifact Registry (successor to Container Registry) provides:
+  #   - Regional storage (co-located with Vertex AI workers = faster pulls)
+  #   - Vulnerability scanning on push
+  #   - IAM-controlled access (vs public Docker Hub)
   - name: "gcr.io/cloud-builders/docker"
     id: push-container
     args:
@@ -54,6 +94,15 @@ steps:
     waitFor: ["build-container"]
 
   # ── Step 4: Compile & submit Vertex AI KFP pipeline ──────────────────────────
+  # Installs kfp SDK in a Python container, then runs pipeline.py which:
+  #   a) Compiles the Python @dsl.pipeline function to churn_pipeline.json
+  #   b) Creates a Vertex AI PipelineJob and submits it (non-blocking)
+  #
+  # The pipeline runs asynchronously in Vertex AI after this step completes.
+  # Training may take 30-90 minutes; the canary deploy step uses the latest
+  # registered model, which is updated once the pipeline finishes (later).
+  # In a production setup you'd add a polling step or wait for a Pub/Sub
+  # notification from Vertex AI before proceeding to the canary deploy.
   - name: "python:3.10-slim"
     id: submit-pipeline
     entrypoint: bash
@@ -68,17 +117,43 @@ steps:
           --pipeline_root=$_PIPELINE_ROOT \
           --model_name=$_MODEL_NAME \
           --auc_threshold=$_AUC_THRESHOLD \
-          --run_date=$SHORT_SHA
-    waitFor: ["push-container"]
+          --run_date=$SHORT_SHA    # use git SHA as run date for traceability in console
+    waitFor: ["push-container"]   # pipeline uses the freshly pushed container image
 
   # ── Step 5: Canary deploy (5% traffic to new model) ──────────────────────────
+  # Deploys the latest registered model to a prediction endpoint at 5% traffic.
+  #
+  # What is a canary deploy?
+  #   A traffic-split deployment where a small fraction of production requests
+  #   are routed to the new model version while 95% still hit the existing stable
+  #   model. If monitoring detects errors or drift on the canary, roll back by
+  #   updating the traffic split back to 100% on the stable model.
+  #
+  # How traffic splitting works in Vertex AI:
+  #   Each deployed model on an endpoint gets a traffic percentage.
+  #   The API key '0' (integer zero) is the placeholder for existing deployed models.
+  #   '--traffic-split="0=95,new=5"' means:
+  #     - existing models (combined) get 95%
+  #     - the newly deployed model gets 5%
+  #
+  # Flow:
+  #   1. Find the latest registered model matching _MODEL_NAME.
+  #   2. Find (or create) the endpoint for this model.
+  #   3. Deploy the model to the endpoint at 5% traffic.
+  #   4. After A/B validation (done outside this pipeline), promote to 100%
+  #      by running: gcloud ai endpoints deploy-model ... --traffic-split="0=0,new=100"
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     id: canary-deploy
     entrypoint: bash
     args:
       - -c
       - |
-        set -e
+        set -e  # exit immediately on any error
+
+        # ── Find the latest registered model ────────────────────────────────
+        # --sort-by="~updateTime" sorts descending (newest first; ~ = reverse)
+        # --limit=1 takes only the most recent model version
+        # 2>/dev/null suppresses API errors when no model exists yet
         MODEL_ID=$(gcloud ai models list \
           --region=$_REGION \
           --project=$_PROJECT_ID \
@@ -87,11 +162,16 @@ steps:
           --limit=1 \
           --format="value(name)" 2>/dev/null || echo "")
 
+        # Guard: the KFP pipeline is asynchronous; the model may not be registered
+        # yet (especially on the first-ever run). Skip the deploy and let the next
+        # build trigger pick it up once training completes.
         if [ -z "$MODEL_ID" ]; then
           echo "No model registered yet — skipping canary deploy"
           exit 0
         fi
 
+        # ── Find or create the prediction endpoint ───────────────────────────
+        # head -1 guards against multiple endpoints with the same display name
         ENDPOINT_ID=$(gcloud ai endpoints list \
           --region=$_REGION \
           --project=$_PROJECT_ID \
@@ -100,6 +180,8 @@ steps:
 
         if [ -z "$ENDPOINT_ID" ]; then
           echo "Creating endpoint..."
+          # Endpoint creation is fast (~30 sec). The endpoint itself is just a
+          # load-balancer stub; models are deployed to it separately.
           ENDPOINT_ID=$(gcloud ai endpoints create \
             --display-name=$_MODEL_NAME-endpoint \
             --region=$_REGION \
@@ -107,18 +189,24 @@ steps:
             --format="value(name)")
         fi
 
+        # ── Deploy at 5% canary traffic ──────────────────────────────────────
         echo "Deploying $MODEL_ID to $ENDPOINT_ID at 5% traffic..."
         gcloud ai endpoints deploy-model "$ENDPOINT_ID" \
           --model="$MODEL_ID" \
           --region=$_REGION \
           --project=$_PROJECT_ID \
-          --display-name="canary-$SHORT_SHA" \
-          --machine-type=n1-standard-4 \
-          --traffic-split="0=95,new=5"
+          --display-name="canary-$SHORT_SHA" \   # track which git SHA introduced this canary
+          --machine-type=n1-standard-4 \          # 4 vCPU, 15 GB RAM for inference
+          --traffic-split="0=95,new=5"            # 5% to this canary, 95% to existing models
 
         echo "✓ Canary deployed at 5% traffic"
+        echo "  Monitor at: https://console.cloud.google.com/vertex-ai/endpoints?project=$_PROJECT_ID"
+        echo "  To promote: gcloud ai endpoints deploy-model $ENDPOINT_ID --traffic-split='0=0,new=100'"
     waitFor: ["submit-pipeline"]
 
+# ── Build artifacts pushed to Artifact Registry ──────────────────────────────
+# Cloud Build records these image URIs in the build history for audit purposes.
+# Both tags are listed so the build summary shows both immutable and latest.
 images:
   - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train:$SHORT_SHA"
   - "$_REGION-docker.pkg.dev/$_PROJECT_ID/$_REPO/churn-train:latest"

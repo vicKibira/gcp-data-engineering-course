@@ -1,0 +1,59 @@
+# Phase 05 — dbt profiles.yml
+#
+# profiles.yml configures how dbt connects to BigQuery.
+# It MUST live in the same directory as dbt_project.yml (project-level profile),
+# OR in ~/.dbt/profiles.yml (user-level profile shared across projects).
+#
+# For this course we keep it alongside the project for portability.
+# Pass --profiles-dir . to dbt commands to use this file:
+#   dbt run --profiles-dir .
+#
+# Authentication:
+#   method: oauth    — uses Application Default Credentials (ADC).
+#   ADC picks up credentials in this order:
+#     1. GOOGLE_APPLICATION_CREDENTIALS env var (path to service account JSON)
+#     2. gcloud auth application-default login (developer workstation)
+#     3. Attached service account (when running inside GCE/Dataproc/Composer)
+#
+#   For production (Composer), the DAG sets the SA via Workload Identity —
+#   no credential file needed on disk.
+#
+# Targets:
+#   dev  — developer workstation; uses your personal gcloud credentials
+#   prod — Cloud Composer environment; uses the Composer service account
+#
+# To switch targets:
+#   dbt run --target dev    # (default)
+#   dbt run --target prod
+#
+# ⚠  IMPORTANT: Never commit a JSON key file path or credentials to git.
+#    Use ADC or Workload Identity in all environments.
+
+gcp_course:                      # must match 'profile' in dbt_project.yml
+  target: dev                    # default target when --target is not specified
+  outputs:
+
+    # ── Developer workstation ─────────────────────────────────────────────────
+    dev:
+      type: bigquery
+      method: oauth                      # ADC — picks up gcloud or SA credentials
+      project: "YOUR_PROJECT_ID"         # ← replace with your GCP project ID
+      dataset: "course_dataset"          # ← replace with your BigQuery dataset name
+      location: "US"                     # BQ dataset location (must match Terraform var)
+      threads: 4                         # parallel model execution (4 is safe for BQ)
+      timeout_seconds: 300               # max time for a single BQ query (5 minutes)
+      priority: interactive              # BQ slot priority: interactive | batch
+      # Optional: retries for transient BQ errors (network blips, slot exhaustion)
+      retries: 1
+
+    # ── Cloud Composer (production) ───────────────────────────────────────────
+    prod:
+      type: bigquery
+      method: oauth                      # Composer SA credentials via Workload Identity
+      project: "YOUR_PROJECT_ID"         # ← same project as dev
+      dataset: "course_dataset_prod"     # ← separate dataset for production data
+      location: "US"
+      threads: 8                         # more threads for faster nightly batch runs
+      timeout_seconds: 600               # longer timeout for large incremental loads
+      priority: batch                    # batch priority: cheaper, slightly slower
+      retries: 2                         # retry transient errors before failing the DAG

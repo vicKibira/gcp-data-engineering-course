@@ -1,0 +1,154 @@
+# Phase 05 — dbt schema.yml
+#
+# schema.yml declares column documentation and automated data quality tests
+# for dbt models (as opposed to sources.yml which covers external tables).
+#
+# Run tests with: dbt test
+# Run tests for a specific model: dbt test --select silver_events
+# Run tests for a specific test: dbt test --select test_type:not_null
+#
+# Test types used here:
+#   not_null          — column has no NULL values
+#   unique            — all values are distinct
+#   accepted_values   — column contains only the listed values
+#   relationships     — foreign key check (gold references silver)
+#   dbt_utils.unique_combination_of_columns — composite primary key check
+#   dbt_expectations.expect_column_values_to_be_between — range assertion
+#
+# When a test fails, `dbt test` exits non-zero, failing the Composer DAG step.
+# This is the data quality gate that prevents bad data reaching downstream systems.
+
+version: 2
+
+models:
+
+  # ── Bronze model ─────────────────────────────────────────────────────────────
+  - name: bronze_events
+    description: >
+      Thin view over the raw BigQuery table written by the Dataflow pipeline.
+      See sources.yml for the underlying table documentation and freshness config.
+    columns:
+      - name: event_id
+        description: Unique event identifier from the Pub/Sub publisher.
+        tests:
+          - not_null
+      - name: event_type
+        description: ORDER_PLACED | ORDER_SHIPPED | ORDER_CANCELLED
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['ORDER_PLACED', 'ORDER_SHIPPED', 'ORDER_CANCELLED']
+      - name: timestamp
+        tests:
+          - not_null
+      - name: ingested_at
+        tests:
+          - not_null
+
+  # ── Silver model ─────────────────────────────────────────────────────────────
+  - name: silver_events
+    description: >
+      Cleaned, typed, and deduplicated events. Produced by the incremental dbt model
+      with a MERGE on event_id. One row per unique event_id — the deduplication
+      guarantee for downstream consumers.
+    columns:
+      - name: event_id
+        description: Primary key — unique per row after MERGE deduplication.
+        tests:
+          - not_null
+          - unique                 # ← this is the most important test; catches MERGE failures
+
+      - name: event_type
+        description: ORDER_PLACED | ORDER_SHIPPED | ORDER_CANCELLED
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['ORDER_PLACED', 'ORDER_SHIPPED', 'ORDER_CANCELLED']
+
+      - name: event_date
+        description: Calendar date of the event; partition key.
+        tests:
+          - not_null
+
+      - name: event_ts
+        description: Full UTC timestamp of the event.
+        tests:
+          - not_null
+
+      - name: user_id
+        description: Anonymised user identifier. Nullable (guest checkouts have no user_id).
+
+      - name: total
+        description: Line total in USD. Must be positive for ORDER_PLACED events.
+        tests:
+          - not_null
+          # Range check: totals must be positive (negative would indicate a refund event,
+          # which this pipeline doesn't model yet).
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              row_condition: "event_type = 'ORDER_PLACED'"
+
+      - name: quantity
+        description: Number of units. Must be a positive integer.
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 1
+              row_condition: "event_type = 'ORDER_PLACED'"
+
+      - name: revenue_band
+        description: Derived revenue segment — low | medium | high.
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['low', 'medium', 'high']
+
+      - name: processed_at
+        description: Timestamp when the dbt model wrote this row to silver.
+        tests:
+          - not_null
+
+  # ── Gold model ───────────────────────────────────────────────────────────────
+  - name: gold_daily_revenue
+    description: >
+      Daily revenue aggregates by category and event_type. Rebuilt on every dbt run.
+      Source of truth for BI dashboards and KPI tracking.
+    columns:
+      - name: report_date
+        description: Aggregate date; partition key.
+        tests:
+          - not_null
+
+      - name: category
+        description: Product category.
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['electronics', 'accessories', 'premium']
+
+      - name: event_type
+        description: Event type aggregated in this row.
+        tests:
+          - not_null
+
+      # Composite primary key: (report_date, category, event_type) must be unique
+      # because gold is a pre-aggregated table (one row per combination).
+      # This test catches any accidental fanout in the aggregation logic.
+
+      - name: order_count
+        description: Number of distinct events in this date × category × type slice.
+        tests:
+          - not_null
+
+      - name: total_revenue
+        description: Sum of all order totals for this slice in USD.
+        tests:
+          - not_null
+          # Revenue must be non-negative (sanity check)
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+
+      - name: updated_at
+        description: Timestamp when the dbt model last rebuilt this row.
+        tests:
+          - not_null

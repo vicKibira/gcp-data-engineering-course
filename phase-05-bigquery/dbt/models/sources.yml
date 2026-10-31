@@ -1,0 +1,90 @@
+# Phase 05 — dbt sources.yml
+#
+# sources.yml declares external tables (not owned by dbt) that dbt models read from.
+# In this project, the "bronze" source is the BigQuery table populated by the
+# Dataflow streaming pipeline (phase-04). dbt doesn't create or manage this table —
+# it was created by `01_create_tables.sql` and written by the Beam pipeline.
+#
+# Why declare sources?
+#   1. Lineage: dbt docs generates a full DAG showing Pub/Sub → Dataflow → BQ table → dbt
+#   2. Source freshness: `dbt source freshness` alerts if the table hasn't been updated
+#      in the last N hours (catches Dataflow pipeline failures before data goes stale)
+#   3. Reference via {{ source('bronze', 'bronze_events') }} instead of raw table paths —
+#      if the dataset or table is renamed, update it here once
+#
+# Schema:
+#   name: bronze             — the logical source name (used in {{ source('bronze', ...) }})
+#   database: YOUR_PROJECT   — GCP project ID (BigQuery "database" = project)
+#   schema: course_dataset   — BigQuery dataset name
+#   tables:
+#     - name: bronze_events  — physical table name in BigQuery
+
+version: 2
+
+sources:
+  - name: bronze                        # logical name referenced in {{ source('bronze', ...) }}
+    description: >
+      Raw events table populated in real time by the Dataflow / Apache Beam streaming
+      pipeline (phase-04). Append-only; never modified after insertion.
+    database: "YOUR_PROJECT_ID"         # ← replace with your GCP project ID
+    schema: "course_dataset"            # ← replace with your BigQuery dataset name
+
+    # Source freshness check: alert if no new rows in last 6 hours.
+    # Run: dbt source freshness
+    loaded_at_field: ingested_at        # the timestamp column dbt checks for freshness
+    freshness:
+      warn_after: {count: 6, period: hour}   # warning if no new data in 6 hours
+      error_after: {count: 24, period: hour} # failure alert if stale for 24 hours
+
+    tables:
+      - name: bronze_events             # physical BigQuery table name
+        description: >
+          Raw e-commerce events (ORDER_PLACED, ORDER_SHIPPED, ORDER_CANCELLED)
+          ingested from Pub/Sub via the Dataflow Beam pipeline in phase-04.
+          One row per event; may contain duplicates (Pub/Sub at-least-once delivery).
+          Deduplication happens in the Silver dbt model via MERGE on event_id.
+
+        # Column-level documentation for dbt docs and lineage
+        columns:
+          - name: event_id
+            description: Unique event identifier from the publisher; may have duplicates due to retries.
+            tests:
+              - not_null
+
+          - name: event_type
+            description: Type of the e-commerce event.
+            tests:
+              - not_null
+              - accepted_values:
+                  values: ['ORDER_PLACED', 'ORDER_SHIPPED', 'ORDER_CANCELLED']
+
+          - name: timestamp
+            description: Event creation time in UTC (ISO-8601).
+            tests:
+              - not_null
+
+          - name: user_id
+            description: Anonymised user identifier.
+
+          - name: product_id
+            description: Product SKU referenced in this event.
+
+          - name: product
+            description: Human-readable product name.
+
+          - name: category
+            description: Product category (electronics, accessories, premium).
+            tests:
+              - accepted_values:
+                  values: ['electronics', 'accessories', 'premium']
+
+          - name: quantity
+            description: Number of units involved in this event.
+
+          - name: total
+            description: Line total in USD (quantity × unit price).
+
+          - name: ingested_at
+            description: Timestamp when the Dataflow pipeline wrote this row to BigQuery.
+            tests:
+              - not_null

@@ -1,26 +1,63 @@
-name: "gcp_course"
+# Phase 05 — dbt project configuration
+#
+# dbt (data build tool) is a SQL transformation framework that adds:
+#   - Modular, reusable SQL (models reference each other via {{ ref() }})
+#   - Automated testing (not-null, unique, accepted-values, relationships)
+#   - Documentation generation (dbt docs generate)
+#   - Incremental loading (only process new/changed rows)
+#   - DAG-based dependency management (dbt builds the run order automatically)
+#
+# Run commands (from this directory):
+#   dbt deps                          # install packages from packages.yml
+#   dbt run --select bronze           # materialise bronze views
+#   dbt run --select silver           # run incremental silver models
+#   dbt run --select gold             # build gold aggregation tables
+#   dbt test                          # run all schema tests
+#   dbt docs generate && dbt docs serve  # open documentation in browser
+
+name: "gcp_course"      # project name — must match profile name in profiles.yml
 version: "1.0.0"
 config-version: 2
 
+# Which profile (in profiles.yml) to use for BQ connection
 profile: "gcp_course"
 
-model-paths:   ["models"]
-macro-paths:   ["macros"]
-target-path:   "target"
-clean-targets: ["target", "dbt_packages"]
+# Directory layout — dbt looks here for models, macros, compiled SQL, etc.
+model-paths:   ["models"]          # SQL model files live here
+macro-paths:   ["macros"]          # custom Jinja macros (helper functions)
+target-path:   "target"            # compiled SQL and docs go here (git-ignored)
+clean-targets: ["target", "dbt_packages"]  # dbt clean removes these directories
 
 models:
   gcp_course:
+    # ── Bronze layer ─────────────────────────────────────────────────────────
+    # Bronze models are simple pass-through views over the raw BigQuery tables
+    # populated by the Dataflow streaming pipeline. Views cost nothing to store
+    # and always reflect the latest data.
     bronze:
-      +materialized: view
-      +schema: bronze
+      +materialized: view           # view = no storage cost; always fresh
+      +schema: bronze               # tables land in PROJECT.bronze_SCHEMA in BQ
+
+    # ── Silver layer ─────────────────────────────────────────────────────────
+    # Silver models use incremental materialisation with a merge strategy.
+    # On the first run dbt creates the table. On subsequent runs it only
+    # processes rows newer than the current max(event_date) in the target table.
+    # unique_key = 'event_id' ensures that if a duplicate arrives it UPDATES
+    # the existing row rather than appending a duplicate.
     silver:
-      +materialized: incremental
-      +schema: silver
-      +incremental_strategy: merge
+      +materialized: incremental    # merge-on-unique_key; only processes new rows
+      +schema: silver               # tables land in PROJECT.silver_SCHEMA in BQ
+      +incremental_strategy: merge  # MERGE statement (BigQuery supports this natively)
+
+    # ── Gold layer ───────────────────────────────────────────────────────────
+    # Gold models are full-refresh aggregation tables. dbt rebuilds them from
+    # scratch on every run (no incremental). Because they aggregate silver data
+    # they are small in row count and fast to rebuild.
     gold:
-      +materialized: table
-      +schema: gold
+      +materialized: table          # full-refresh table; rebuilt on every dbt run
+      +schema: gold                 # tables land in PROJECT.gold_SCHEMA in BQ
+      # Partition and cluster are set here as project defaults;
+      # individual models can override in their own config() blocks.
       +partition_by:
         field: "report_date"
         data_type: "date"
